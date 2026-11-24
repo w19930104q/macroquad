@@ -843,6 +843,10 @@ impl QuadGl {
         self.state.viewport = viewport;
     }
 
+    pub const fn get_viewport_state(&self) -> Option<(i32, i32, i32, i32)> {
+        self.state.viewport
+    }
+
     pub fn get_viewport(&self) -> (i32, i32, i32, i32) {
         self.state.viewport.unwrap_or((
             0,

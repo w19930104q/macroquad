@@ -494,6 +494,19 @@ pub mod test {
     pub static ONCE: std::sync::Once = std::sync::Once::new();
 }
 
+// Internal render state exposed for macroquad's own integration tests, which
+// cannot reach the private `Context` fields from the `tests/` directory.
+#[doc(hidden)]
+pub mod test_helpers {
+    use crate::get_context;
+
+    /// Viewport state currently applied to the GL state machine.
+    /// `None` means the whole screen is used.
+    pub fn active_viewport() -> Option<(i32, i32, i32, i32)> {
+        get_context().gl.get_viewport_state()
+    }
+}
+
 fn get_context() -> &'static mut Context {
     thread_assert::same_thread();
 

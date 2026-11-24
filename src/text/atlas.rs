@@ -401,4 +401,132 @@ mod tests {
 
         std::mem::forget(first_atlas);
     }
+
+    // Fixed sample MQ-E: a particle game packs two dynamic 16x16 textures
+    // into the atlas, updates the second texture's bottom-right 4x4 pixels
+    // at frame 90, and later a third texture forces one atlas rebuild.
+    // Records the UVs of both textures across the partial update and the
+    // rebuild. Invariants: updating texture B must not move texture A, the
+    // partial update lands only inside B's own cell, the rebuild preserves
+    // every sprite's pixels (draw output is identical before and after),
+    // and the repacked layout is deterministic across atlas instances.
+    //
+    // Note: GAP = 2 reserves a border around every sprite, so a 32x32
+    // atlas cannot hold two 16x16 sprites at all; the sample starts at
+    // 64x64 and the recorded UVs are the GAP-adjusted equivalents of the
+    // idealized [0, 0.5]x[0, 0.5] cell.
+    #[test]
+    fn mq_e_uvs_across_partial_update_and_rebuild() {
+        // created before the `atlas` binding shadows the `atlas()` helper
+        let mut replay = atlas(64, 64);
+        let mut atlas = atlas(64, 64);
+
+        let red = Color::new(1.0, 0.0, 0.0, 1.0);
+        let green = Color::new(0.0, 1.0, 0.0, 1.0);
+        let blue = Color::new(0.0, 0.0, 1.0, 1.0);
+
+        let uv = |atlas: &Atlas, key: SpriteKey| {
+            let rect = atlas.get(key).unwrap().rect;
+            let (w, h) = (atlas.width() as f32, atlas.height() as f32);
+            [rect.x / w, rect.y / h, rect.w / w, rect.h / h]
+        };
+
+        // frames 0..89: both dynamic textures are packed into the atlas
+        atlas.cache_sprite(SpriteKey::Id(1), sprite(16, 16, red));
+        atlas.cache_sprite(SpriteKey::Id(2), sprite(16, 16, green));
+        let uv_a0 = uv(&atlas, SpriteKey::Id(1));
+        let uv_b0 = uv(&atlas, SpriteKey::Id(2));
+        eprintln!("MQ-E pack:    A uv={uv_a0:?} B uv={uv_b0:?}");
+
+        // frame 90: partial update — the bottom-right 4x4 pixels of
+        // texture B turn white. macroquad has no atlas partial-update
+        // API (`Texture2D::update_part` only touches the GPU texture,
+        // not the atlas copy), so re-caching the texture is the only
+        // way to refresh an atlas entry.
+        let mut b_updated = sprite(16, 16, green);
+        for y in 12..16 {
+            for x in 12..16 {
+                b_updated.set_pixel(x, y, WHITE);
+            }
+        }
+        atlas.cache_sprite(SpriteKey::Id(2), b_updated.clone());
+        let uv_a1 = uv(&atlas, SpriteKey::Id(1));
+        let uv_b1 = uv(&atlas, SpriteKey::Id(2));
+        eprintln!("MQ-E update:  A uv={uv_a1:?} B uv={uv_b1:?}");
+
+        // updating B must not move A to another cell
+        assert_eq!(uv_a0, uv_a1);
+        // ... but B itself jumps to a fresh cell, and the old cell's
+        // pixels are leaked in the atlas image
+        assert_ne!(uv_b0, uv_b1);
+        let old_b = uv_b0;
+        assert_eq!(
+            atlas.image.get_pixel(
+                (old_b[0] * atlas.width() as f32) as u32,
+                (old_b[1] * atlas.height() as f32) as u32
+            ),
+            green
+        );
+        // the update landed only inside B's new cell: white 4x4 corner,
+        // green everywhere else, and A's pixels untouched
+        let b_rect = atlas.get(SpriteKey::Id(2)).unwrap().rect;
+        let (bx, by) = (b_rect.x as u32, b_rect.y as u32);
+        assert_eq!(atlas.image.get_pixel(bx + 12, by + 12), WHITE);
+        assert_eq!(atlas.image.get_pixel(bx + 15, by + 15), WHITE);
+        assert_eq!(atlas.image.get_pixel(bx + 11, by + 11), green);
+        assert_eq!(atlas.image.get_pixel(bx + 11, by + 15), green);
+        assert_eq!(atlas.image.get_pixel(bx + 15, by + 11), green);
+        let a_rect = atlas.get(SpriteKey::Id(1)).unwrap().rect;
+        assert_eq!(
+            atlas.image.get_pixel(a_rect.x as u32, a_rect.y as u32),
+            red
+        );
+
+        // a third texture does not fit the 64x64 atlas: one rebuild
+        // (grow to 128x128 + repack of every cached sprite)
+        atlas.cache_sprite(SpriteKey::Id(3), sprite(48, 48, blue));
+        assert_eq!((atlas.width(), atlas.height()), (128, 128));
+        let uv_a2 = uv(&atlas, SpriteKey::Id(1));
+        let uv_b2 = uv(&atlas, SpriteKey::Id(2));
+        eprintln!("MQ-E rebuild: A uv={uv_a2:?} B uv={uv_b2:?}");
+
+        // the rebuild renormalizes every UV against the bigger atlas, but
+        // the drawn pixels are identical: A is still solid red and B kept
+        // its white bottom-right 4x4 through the sub_image round-trip
+        let a_rect = atlas.get(SpriteKey::Id(1)).unwrap().rect;
+        let b_rect = atlas.get(SpriteKey::Id(2)).unwrap().rect;
+        assert_eq!(
+            atlas.image.get_pixel(a_rect.x as u32, a_rect.y as u32),
+            red
+        );
+        assert_eq!(
+            atlas
+                .image
+                .get_pixel(b_rect.x as u32 + 12, b_rect.y as u32 + 12),
+            WHITE
+        );
+        assert_eq!(
+            atlas
+                .image
+                .get_pixel(b_rect.x as u32 + 11, b_rect.y as u32 + 11),
+            green
+        );
+
+        // the rebuild is deterministic: replaying the same sequence in a
+        // fresh atlas yields the identical layout, so sprite draw
+        // positions are the same before and after the rebuild
+        replay.cache_sprite(SpriteKey::Id(1), sprite(16, 16, red));
+        replay.cache_sprite(SpriteKey::Id(2), sprite(16, 16, green));
+        replay.cache_sprite(SpriteKey::Id(2), b_updated);
+        replay.cache_sprite(SpriteKey::Id(3), sprite(48, 48, blue));
+        for key in [SpriteKey::Id(1), SpriteKey::Id(2), SpriteKey::Id(3)] {
+            assert_eq!(
+                atlas.get(key).map(|sprite| sprite.rect),
+                replay.get(key).map(|sprite| sprite.rect)
+            );
+        }
+
+        std::mem::forget(atlas);
+        std::mem::forget(replay);
+    }
 }

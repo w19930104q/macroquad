@@ -964,3 +964,62 @@ pub fn set_default_filter_mode(filter: FilterMode) {
     context.default_filter_mode = filter;
     context.texture_batcher.atlas.set_filter(filter);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slotmap::TextureIdSlotMap;
+
+    // Fixed sample MQ-E, refcount half: three particle sprites share one
+    // managed texture. The batcher must not hold a strong ref (it keeps a
+    // weak clone), and once the three sprites exit, the texture's strong
+    // count must be back to 1 — the game's own handle — so the slot is
+    // garbage-collected exactly when that last handle drops.
+    #[test]
+    fn mq_e_texture_refcount_returns_to_one_after_sprites_exit() {
+        let mut slots = TextureIdSlotMap::new();
+        let raw = miniquad::TextureId::from_raw_id(miniquad::RawId::OpenGl(0));
+        let slot = slots.insert(raw);
+
+        // the game's own handle: the only strong ref so far
+        let texture = Texture2D {
+            texture: TextureHandle::Managed(Arc::new(TextureSlotGuarded(slot))),
+        };
+        let strong_count = |texture: &Texture2D| match &texture.texture {
+            TextureHandle::Managed(arc) => Arc::strong_count(arc),
+            _ => panic!("expected a managed texture"),
+        };
+        eprintln!("MQ-E refcount: created       count={}", strong_count(&texture));
+        assert_eq!(strong_count(&texture), 1);
+
+        // the texture batcher registers the texture for atlasing, but
+        // keeps only a weak clone: the refcount must not move
+        let batched = texture.weak_clone();
+        assert!(matches!(batched.texture, TextureHandle::ManagedWeak(_)));
+        eprintln!("MQ-E refcount: batched(weak) count={}", strong_count(&texture));
+        assert_eq!(strong_count(&texture), 1);
+
+        // three sprites enter, each holding its own clone of the texture
+        let sprite1 = texture.clone();
+        let sprite2 = texture.clone();
+        let sprite3 = texture.clone();
+        eprintln!("MQ-E refcount: 3 sprites     count={}", strong_count(&texture));
+        assert_eq!(strong_count(&texture), 4);
+
+        // all three sprites exit: the count returns to 1 and the texture
+        // slot is still alive under the game's remaining handle
+        drop(sprite1);
+        drop(sprite2);
+        drop(sprite3);
+        eprintln!("MQ-E refcount: sprites gone  count={}", strong_count(&texture));
+        assert_eq!(strong_count(&texture), 1);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots.get(slot), Some(raw));
+
+        drop(batched);
+        // `TextureSlotGuarded::drop` schedules GPU deletion through the
+        // global context, which does not exist in a unit test — leak the
+        // last handle instead of dropping it.
+        std::mem::forget(texture);
+    }
+}
